@@ -87,6 +87,7 @@ var playerReady = false;
 var started = false;
 var playlistApplied = false; /* true cuando la playlist efectiva ya se aplicó (cue hecho) */
 var playPending = false; /* true mientras espera el play diferido de doPlay */
+var playRetryCount = 0; /* reintentos del play diferido (máx 10 x 400 ms) */
 var lastState = -1;
 var lastError = "";
 var lastErrorCode = 0; /* último código numérico de error de YouTube (0 = ninguno) */
@@ -185,7 +186,15 @@ function tryApplyPlaylist() {
 function applyPlaylist() {
   started = false;
   /* Nueva playlist efectiva: se resetea la racha de errores y cualquier
-     salto pendiente de la playlist anterior. */
+     salto pendiente de la playlist anterior. Pero si había un error de
+     bloqueo pendiente (llegó antes del cue), se conserva: es el error
+     del video que se está poniendo en cola y el re-chequeo (retryTick)
+     lo necesita para saltarlo si el cue no carga la lista. Sin esto,
+     el temporizador del reintento moría al aplicar la playlist justo
+     cuando más falta hacía (verificado en simulación: cue perdido +
+     config lenta dejaba lista=0 para siempre). */
+  var pendingErrorCode = lastErrorCode;
+  var pendingErrorVideoId = lastErrorVideoId;
   consecutiveErrors = 0;
   lastCountedVideoId = "";
   lastErrorCode = 0;
@@ -206,7 +215,38 @@ function applyPlaylist() {
   } catch (e) {
     lastError = "Al cargar la playlist: " + e.message;
   }
+  if (!currentVideoId &&
+      (pendingErrorCode === 100 || pendingErrorCode === 101 || pendingErrorCode === 150)) {
+    /* Error de bloqueo pendiente de antes del cue: se restaura y se
+       re-arman los reintentos con presupuesto nuevo. Guardar /
+       Restablecer ya borraron el error viejo antes de llamar aquí, así
+       que este error es de la playlist que se acaba de aplicar. */
+    lastErrorCode = pendingErrorCode;
+    lastErrorVideoId = pendingErrorVideoId;
+    lastError = errorText(pendingErrorCode);
+    retryCount = 0;
+    retryTimer = window.setTimeout(retryTick, 1500);
+  }
   window.setTimeout(sendStatus, 1500);
+}
+
+/* Re-emite el cue completo de la playlist efectiva (sin índice) y
+   re-aplica el shuffle. Se usa cuando el cue ya se hizo pero la lista
+   no llegó a cargar (getPlaylist() vacío): un cue con índice no tiene
+   a dónde ir y hay que volver a pedir la lista entera. */
+function recuePlaylist() {
+  if (!playerReady || !player || currentVideoId || !currentPlaylistId) { return false; }
+  try {
+    player.cuePlaylist({ listType: "playlist", list: currentPlaylistId });
+    window.setTimeout(function () {
+      try { player.setShuffle(true); } catch (e2) { /* shuffle opcional */ }
+    }, 1000);
+    return true;
+  } catch (e) {
+    lastError = "Al re-cargar la playlist: " + e.message;
+    sendStatus();
+    return false;
+  }
 }
 
 function stateName(code) {
@@ -296,13 +336,18 @@ function onYouTubeIframeAPIReady() {
   if (apiTimer) { clearTimeout(apiTimer); apiTimer = null; }
   sendStatus();
   try {
-    /* videoId desde el inicio: el embed nunca arranca vacío. Antes se
-       creaba sin videoId y si el cue de la playlist se interrumpía, el
-       reproductor quedaba sin nada que reproducir (error 2 al darle play). */
+    /* SIN videoId inicial, a propósito. Antes se creaba con videoId
+       (configFirstVideoId, vampire) para que el embed nunca arrancara
+       vacío, pero ese video tiene el embed deshabilitado y dispara el
+       error 150 INMEDIATAMENTE al cargar; en ese estado de error el
+       cuePlaylist posterior es ignorado por YouTube y la playlist no
+       llega nunca (verificado en vivo 21:03 CST: lista=0 videos 55 s
+       después de cargar, aplicado=sí). El reproductor vacío del error 2
+       ya no puede ocurrir: el cue de la playlist es único por la guarda
+       tryApplyPlaylist/playlistApplied. */
     player = new YT.Player("ytplayer", {
       height: "720",
       width: "1280",
-      videoId: configFirstVideoId,
       playerVars: { rel: 0, modestbranding: 1, playsinline: 1, origin: window.location.origin },
       events: {
         onReady: onPlayerReady,
@@ -362,16 +407,26 @@ function playlistLength() {
    - started=true: playVideoAt(idx) carga Y reproduce ese video.
    - started=false: cuePlaylist con index=idx solo cambia el video en
      cola, SIN reproducir (nada de autoplay antes de que el usuario
-     pulse OK). Después se re-aplica el shuffle como en applyPlaylist. */
+     pulse OK). Después se re-aplica el shuffle como en applyPlaylist.
+   Si la lista está vacía (el cue no cargó), no hay índice al que ir:
+   se re-emite el cue completo sin índice. */
 function advanceToIndex(idx) {
   if (!playerReady || !player || currentVideoId) { return false; }
   var len = playlistLength();
-  if (len > 0) {
-    if (idx >= len) { idx = 0; }
-    if (idx < 0) { idx = len - 1; }
-  } else if (idx < 0) {
-    idx = 0;
+  if (len === 0) {
+    /* La playlist no llegó a cargar (lista vacía): un cue con índice no
+       tiene a dónde ir. Sin empezar se re-emite el cue completo; ya
+       sonando, playVideoAt(0) es el último recurso (el error quedará
+       visible si tampoco hay nada que reproducir). */
+    if (started) {
+      try { player.playVideoAt(0); } catch (e0) { /* el error queda visible */ }
+    } else {
+      recuePlaylist();
+    }
+    return true;
   }
+  if (idx >= len) { idx = 0; }
+  if (idx < 0) { idx = len - 1; }
   try {
     if (started) {
       player.playVideoAt(idx);
@@ -397,10 +452,10 @@ function advanceToIndex(idx) {
 function skipBlockedVideo() {
   if (currentVideoId) { return false; }
   if (!playerReady || !player || !playlistApplied) { return false; }
-  /* El mismo video puede disparar onError dos veces (error del videoId
-     inicial y error del cue de la playlist): la racha cuenta videos
-     bloqueados DISTINTOS, no eventos repetidos del mismo video. Sin
-     videoId conocido no se puede deducir duplicado y sí se suma. */
+  /* El mismo video puede disparar onError dos veces (al ponerlo en cola
+     y al intentar reproducirlo): la racha cuenta videos bloqueados
+     DISTINTOS, no eventos repetidos del mismo video. Sin videoId
+     conocido no se puede deducir duplicado y sí se suma. */
   if (!lastErrorVideoId || lastErrorVideoId !== lastCountedVideoId) {
     consecutiveErrors++;
     lastCountedVideoId = lastErrorVideoId;
@@ -447,12 +502,12 @@ function onPlayerError(event) {
        salvo que sea un video suelto guardado (ahí no hay a dónde saltar). */
     if (currentVideoId) { sendStatus(); return; }
     if (playlistApplied) { skipBlockedVideo(); return; }
-    /* El error llegó con el videoId inicial, antes de que la playlist
-       se aplicara (cue): se intenta aplicar la playlist y se re-chequea
-       cada 1,5 s, hasta 10 veces (retryTick). Antes era un solo disparo
-       y si a los 1,5 s la playlist aún no estaba aplicada, el salto se
-       perdía para siempre. Normalmente el cue vuelve a disparar el mismo
-       150 para ese video y es ese onError el que salta. */
+    /* El error llegó antes de que la playlist se aplicara (cue): se
+       intenta aplicar la playlist y se re-chequea cada 1,5 s, hasta 10
+       veces (retryTick). Antes era un solo disparo y si a los 1,5 s la
+       playlist aún no estaba aplicada, el salto se perdía para siempre.
+       Normalmente el cue vuelve a disparar el mismo 150 para ese video
+       y es ese onError el que salta. */
     tryApplyPlaylist();
     retryCount = 0;
     if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
@@ -478,6 +533,9 @@ function retryTick() {
   if (retryCount > 10) { return; }
   tryApplyPlaylist();
   if (playlistApplied) {
+    /* La playlist se aplicó pero la lista no llegó a cargar (lista
+       vacía): se re-emite el cue completo antes de intentar el salto. */
+    if (playlistLength() === 0) { recuePlaylist(); }
     skipBlockedVideo();
   } else {
     /* La playlist aún no está aplicada: se reintenta en 1,5 s. */
@@ -512,29 +570,46 @@ function playFromCurrent() {
   player.playVideoAt(0);
 }
 
+/* Play diferido de doPlay: si la playlist aún no está aplicada (config
+   lenta o OK muy temprano), se espera en tramos de 400 ms hasta 10 veces
+   en vez de llamar a playVideoAt(0) en un reproductor vacío, que daría
+   error 2. Sin videoId inicial ya no hay video de respaldo que tape
+   esa espera. */
+function finishDoPlay() {
+  playPending = false;
+  try {
+    if (!playlistApplied) {
+      if (playRetryCount < 10) {
+        playRetryCount++;
+        playPending = true;
+        window.setTimeout(finishDoPlay, 400);
+        return;
+      }
+      lastError = "La playlist aún no cargó; pulsa OK de nuevo en un momento.";
+      sendStatus();
+      return;
+    }
+    started = true;
+    playFromCurrent();
+  } catch (e2) {
+    lastError = "Al reproducir: " + e2.message;
+    sendStatus();
+  }
+}
+
 function doPlay() {
   if (!playerReady || !player) { return false; }
   try {
     if (!started) {
       if (!playlistApplied) {
         /* La playlist aún no está aplicada (config lenta o play muy
-           temprano): se aplica ahora y se espera ~400 ms a que el cue
-           cargue antes de reproducir. El reproductor ya tiene videoId,
-           así que aunque el cue tardara, playVideoAt(0) tiene un video
-           válido y no da error 2. */
+           temprano): se aplica ahora y se espera a que cargue antes de
+           reproducir (finishDoPlay reintenta en tramos de 400 ms). */
         if (playPending) { return true; }
         playPending = true;
+        playRetryCount = 0;
         tryApplyPlaylist();
-        window.setTimeout(function () {
-          playPending = false;
-          try {
-            started = true;
-            playFromCurrent();
-          } catch (e2) {
-            lastError = "Al reproducir: " + e2.message;
-            sendStatus();
-          }
-        }, 400);
+        window.setTimeout(finishDoPlay, 400);
         return true;
       }
       started = true;
@@ -690,6 +765,7 @@ function saveSettings() {
     currentVideoId = "";
     playlistSource = "override";
     playlistApplied = false; /* cambió la playlist efectiva: se vuelve a aplicar */
+    lastErrorCode = 0; lastErrorVideoId = ""; /* el error viejo era de la playlist anterior */
     applyPlaylist();
     setSettingsMsg("Playlist guardada en esta TV: " + res.playlistId + ". Ya está sonando en aleatorio con OK.", true);
     refreshSettingsPanel();
@@ -700,6 +776,7 @@ function saveSettings() {
     currentPlaylistId = "";
     playlistSource = "video";
     playlistApplied = false; /* cambió la playlist efectiva: se vuelve a aplicar */
+    lastErrorCode = 0; lastErrorVideoId = ""; /* el error viejo era del video anterior */
     applyPlaylist();
     setSettingsMsg("Ojo: eso no era una playlist, era un solo video. Se guardó ese video (" + res.videoId + ") y se reproduce solo. Para una playlist, pega un enlace con list=…", true);
     refreshSettingsPanel();
@@ -714,6 +791,7 @@ function resetSettings() {
   currentVideoId = "";
   playlistSource = "default";
   playlistApplied = false; /* cambió la playlist efectiva: se vuelve a aplicar */
+  lastErrorCode = 0; lastErrorVideoId = ""; /* el error viejo era de la playlist anterior */
   applyPlaylist();
   setSettingsMsg("Listo: se borró lo guardado y volvió la playlist por defecto (" + configPlaylistId + ").", true);
   refreshSettingsPanel();
