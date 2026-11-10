@@ -99,6 +99,9 @@ var retryTimer = null; /* temporizador del re-chequeo si el error llegó antes d
 var retryCount = 0; /* intentos del re-chequeo persistente (máx 10) */
 var shuffleTimer = null; /* temporizador del shuffle diferido (500 ms x 20) */
 var shuffleChecks = 0; /* revisiones hechas esperando a que cargue la lista */
+var watchTimer = null; /* temporizador del vigilante de carga de lista (2 s) */
+var watchChecks = 0; /* revisiones del vigilante desde su último arranque */
+var recueCount = 0; /* re-cues hechos por el vigilante (máx 3 por playlist efectiva) */
 var skipAttempts = 0; /* saltos automáticos intentados (diagnóstico) */
 var lastSkipCheck = ""; /* resultado real del último salto (diagnóstico) */
 var apiTimer = null;
@@ -204,6 +207,9 @@ function applyPlaylist() {
   if (skipTimer) { clearTimeout(skipTimer); skipTimer = null; }
   if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
   if (shuffleTimer) { clearTimeout(shuffleTimer); shuffleTimer = null; }
+  recueCount = 0;
+  watchChecks = 0;
+  if (watchTimer) { clearTimeout(watchTimer); watchTimer = null; }
   if (!playerReady || !player) { sendStatus(); return; }
   try {
     if (currentVideoId) {
@@ -216,6 +222,9 @@ function applyPlaylist() {
   } catch (e) {
     lastError = "Al cargar la playlist: " + e.message;
   }
+  /* El vigilante observa si la lista llega a cargar: si el cue se pierde,
+     él lo re-emite. Solo para playlists (un video suelto no tiene lista). */
+  if (!currentVideoId) { startWatchdog(); }
   if (!currentVideoId &&
       (pendingErrorCode === 100 || pendingErrorCode === 101 || pendingErrorCode === 150)) {
     /* Error de bloqueo pendiente de antes del cue: se restaura y se
@@ -240,12 +249,63 @@ function recuePlaylist() {
   try {
     player.cuePlaylist({ listType: "playlist", list: currentPlaylistId });
     scheduleShuffle();
+    /* Si el vigilante no está corriendo, se arranca para observar este
+       cue nuevo. Si ya corre (lo llamó él mismo en su revisión), no se
+       reinicia: su presupuesto de 30 s sigue anclado al cue inicial. */
+    if (!watchTimer) { startWatchdog(); }
     return true;
   } catch (e) {
     lastError = "Al re-cargar la playlist: " + e.message;
     sendStatus();
     return false;
   }
+}
+
+/* Mensaje visible cuando la lista no carga ni con re-cues: no es un error
+   de YouTube (no lleva código), es nuestro diagnóstico. */
+var WATCHDOG_MSG = "La playlist no cargó en este navegador (lista vacía tras 3 intentos). En la TV puede funcionar; prueba ahí.";
+
+/* Vigilante de carga de la lista. El cue se emite una sola vez en
+   applyPlaylist y, si se pierde (condición de carrera, o YouTube no
+   responde), nada lo reintentaba en el camino sin errores: la lista
+   quedaba en 0 para siempre y OK no hacía nada (verificado en vivo
+   22:07-22:10 CST: lista=0 a los 150 s, sin error, cue con el ID
+   correcto). El vigilante revisa cada 2 s si getPlaylist() ya tiene
+   videos; si sigue vacía, re-emite el cue (máx 3 veces, con 4 s entre
+   re-cues). A los ~30 s sin cargar se detiene con el mensaje visible
+   y el reproductor queda en pausa, sin reproducir solo. Se cancela en
+   applyPlaylist() al cambiar la playlist efectiva, y cuando la lista
+   carga. */
+function startWatchdog() {
+  if (watchTimer) { clearTimeout(watchTimer); watchTimer = null; }
+  watchChecks = 0;
+  watchTimer = window.setTimeout(watchPlaylist, 2000);
+}
+
+function watchPlaylist() {
+  if (!playerReady || !player || currentVideoId) { watchTimer = null; return; }
+  if (playlistLength() > 0) {
+    /* La lista cargó: el vigilante se detiene. Si quedó el mensaje de
+       un intento anterior, se borra (ya no aplica). */
+    watchTimer = null;
+    if (lastError === WATCHDOG_MSG) { lastError = ""; }
+    sendStatus();
+    return;
+  }
+  watchChecks++;
+  if (watchChecks >= 15) { /* ~30 s sin cargar */
+    watchTimer = null;
+    lastError = WATCHDOG_MSG;
+    sendStatus();
+    return;
+  }
+  if (recueCount < 3 && watchChecks % 2 === 0) {
+    /* 2 revisiones = 4 s desde el cue anterior (o desde el arranque). */
+    recueCount++;
+    recuePlaylist();
+  }
+  watchTimer = window.setTimeout(watchPlaylist, 2000);
+  sendStatus();
 }
 
 /* Shuffle DIFERIDO: setShuffle(true) solo cuando la lista ya cargó.
@@ -332,7 +392,8 @@ function sendStatus() {
     html += '<br><span style="font-size:15px;color:#888">Diag: lista=' +
       playlistLength() + ' videos · aplicado=' + (playlistApplied ? "sí" : "no") +
       ' · saltos=' + skipAttempts + ' · último salto: ' + (lastSkipCheck || "—") +
-      ' · lista-id=' + (currentVideoId ? ("video:" + currentVideoId) : (currentPlaylistId || "—")) + '</span>';
+      ' · lista-id=' + (currentVideoId ? ("video:" + currentVideoId) : (currentPlaylistId || "—")) +
+      ' · re-cues=' + recueCount + '</span>';
     mini.innerHTML = html;
   }
   try {
@@ -594,24 +655,42 @@ function playFromCurrent() {
     advanceToIndex(playlistIndex() + 1);
     return;
   }
+  if (playlistLength() === 0) {
+    /* Lista vacía (el cue se perdió): playVideoAt(0) en vacío no hace
+       nada. Se re-emite el cue y se espera a que cargue: finishDoPlay
+       reintenta el play en tramos de 400 ms hasta 4 s; si la lista
+       carga, reproduce; si no, se rinde con mensaje y OK se puede
+       pulsar de nuevo (finishDoPlay pone started=false al rendirse). */
+    if (!recuePlaylist()) { started = false; return; }
+    started = true;
+    playRetryCount = 0;
+    playPending = true;
+    window.setTimeout(finishDoPlay, 400);
+    return;
+  }
   player.playVideoAt(0);
 }
 
 /* Play diferido de doPlay: si la playlist aún no está aplicada (config
-   lenta o OK muy temprano), se espera en tramos de 400 ms hasta 10 veces
+   lenta o OK muy temprano), o si está aplicada pero la lista aún no
+   cargó (cue perdido), se espera en tramos de 400 ms hasta 10 veces
    en vez de llamar a playVideoAt(0) en un reproductor vacío, que daría
    error 2. Sin videoId inicial ya no hay video de respaldo que tape
    esa espera. */
 function finishDoPlay() {
   playPending = false;
   try {
-    if (!playlistApplied) {
+    if (!playlistApplied || (!currentVideoId && playlistLength() === 0)) {
       if (playRetryCount < 10) {
         playRetryCount++;
         playPending = true;
         window.setTimeout(finishDoPlay, 400);
         return;
       }
+      /* Se rinde: started vuelve a false para que OK se pueda pulsar
+         de nuevo (y vuelva a re-emitir el cue). El mensaje del
+         vigilante, si llega, explica qué pasa. */
+      started = false;
       lastError = "La playlist aún no cargó; pulsa OK de nuevo en un momento.";
       sendStatus();
       return;
