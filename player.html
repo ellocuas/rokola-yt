@@ -97,6 +97,8 @@ var lastCountedVideoId = ""; /* último video que ya sumó a la racha (anti-dobl
 var skipTimer = null; /* temporizador del salto automático (800 ms) */
 var retryTimer = null; /* temporizador del re-chequeo si el error llegó antes del cue */
 var retryCount = 0; /* intentos del re-chequeo persistente (máx 10) */
+var shuffleTimer = null; /* temporizador del shuffle diferido (500 ms x 20) */
+var shuffleChecks = 0; /* revisiones hechas esperando a que cargue la lista */
 var skipAttempts = 0; /* saltos automáticos intentados (diagnóstico) */
 var lastSkipCheck = ""; /* resultado real del último salto (diagnóstico) */
 var apiTimer = null;
@@ -201,15 +203,14 @@ function applyPlaylist() {
   lastErrorVideoId = "";
   if (skipTimer) { clearTimeout(skipTimer); skipTimer = null; }
   if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+  if (shuffleTimer) { clearTimeout(shuffleTimer); shuffleTimer = null; }
   if (!playerReady || !player) { sendStatus(); return; }
   try {
     if (currentVideoId) {
       player.cueVideoById(currentVideoId);
     } else {
       player.cuePlaylist({ listType: "playlist", list: currentPlaylistId });
-      window.setTimeout(function () {
-        try { player.setShuffle(true); } catch (e2) { /* shuffle opcional */ }
-      }, 1000);
+      scheduleShuffle();
     }
     playlistApplied = true;
   } catch (e) {
@@ -238,15 +239,42 @@ function recuePlaylist() {
   if (!playerReady || !player || currentVideoId || !currentPlaylistId) { return false; }
   try {
     player.cuePlaylist({ listType: "playlist", list: currentPlaylistId });
-    window.setTimeout(function () {
-      try { player.setShuffle(true); } catch (e2) { /* shuffle opcional */ }
-    }, 1000);
+    scheduleShuffle();
     return true;
   } catch (e) {
     lastError = "Al re-cargar la playlist: " + e.message;
     sendStatus();
     return false;
   }
+}
+
+/* Shuffle DIFERIDO: setShuffle(true) solo cuando la lista ya cargó.
+   Antes se llamaba a los 1000 ms del cue, cuando la playlist todavía
+   estaba cargando, y ese shuffle sobre una lista aún vacía podía
+   interrumpir o cancelar la carga pendiente (verificado en vivo
+   21:42-21:45 CST: cue con el ID correcto, aplicado=sí, pero lista=0
+   incluso 70 s después). Ahora se revisa cada 500 ms: en cuanto
+   playlistLength() > 0 se aplica el shuffle UNA vez; si a los 10 s la
+   lista sigue vacía, se deja de intentar (la lista se reproduce sin
+   aleatorizar, pero se reproduce). Se cancela en applyPlaylist()
+   cuando cambia la playlist efectiva, como skipTimer/retryTimer. */
+function scheduleShuffle() {
+  if (shuffleTimer) { clearTimeout(shuffleTimer); shuffleTimer = null; }
+  if (currentVideoId || !currentPlaylistId) { return; }
+  shuffleChecks = 0;
+  shuffleTimer = window.setTimeout(shuffleTick, 500);
+}
+
+function shuffleTick() {
+  shuffleTimer = null;
+  if (!playerReady || !player || currentVideoId) { return; }
+  if (playlistLength() > 0) {
+    try { player.setShuffle(true); } catch (e) { /* shuffle opcional */ }
+    return;
+  }
+  shuffleChecks++;
+  if (shuffleChecks >= 20) { return; } /* 10 s: se reproduce sin aleatorizar */
+  shuffleTimer = window.setTimeout(shuffleTick, 500);
 }
 
 function stateName(code) {
@@ -303,7 +331,8 @@ function sendStatus() {
     if (lastError) { html += ' · <span class="err">Error: ' + lastError + "</span>"; }
     html += '<br><span style="font-size:15px;color:#888">Diag: lista=' +
       playlistLength() + ' videos · aplicado=' + (playlistApplied ? "sí" : "no") +
-      ' · saltos=' + skipAttempts + ' · último salto: ' + (lastSkipCheck || "—") + '</span>';
+      ' · saltos=' + skipAttempts + ' · último salto: ' + (lastSkipCheck || "—") +
+      ' · lista-id=' + (currentVideoId ? ("video:" + currentVideoId) : (currentPlaylistId || "—")) + '</span>';
     mini.innerHTML = html;
   }
   try {
@@ -433,9 +462,7 @@ function advanceToIndex(idx) {
     } else {
       if (!currentPlaylistId) { return false; }
       player.cuePlaylist({ listType: "playlist", list: currentPlaylistId, index: idx });
-      window.setTimeout(function () {
-        try { player.setShuffle(true); } catch (e2) { /* shuffle opcional */ }
-      }, 1000);
+      scheduleShuffle();
     }
     return true;
   } catch (e) {
