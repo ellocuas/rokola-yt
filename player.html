@@ -50,7 +50,20 @@
   #setMsg{margin-top:18px;font-size:20px;line-height:1.5;min-height:30px}
   #setMsg.ok{color:#7dffb0}
   #setMsg.err{color:#ff8080}
+  #miniBar .ok{color:#7dffb0}
   .setHint{margin-top:18px;font-size:18px;color:#aaa;line-height:1.5}
+  /* Lista de playlists para elegir (dentro de Ajustes). Con scroll propio
+     para que el panel no crezca sin límite en la TV. */
+  #settings h3{font-size:24px;color:#ffd166;margin:20px 0 8px}
+  #presetList{max-height:300px;overflow-y:auto;border:2px solid #333;border-radius:10px;padding:6px 10px;background:#0d0d1a}
+  .presetCat{font-size:20px;color:#ffd166;margin:12px 0 6px;padding-bottom:4px;border-bottom:1px solid #333}
+  .presetRow{padding:10px 12px;border-radius:8px;cursor:pointer}
+  .presetRow:focus{outline:3px solid #ffd166;background:#14202e}
+  .presetRow.active{background:#123324}
+  .presetRow.active .presetName{color:#7dffb0}
+  .presetName{display:block;font-size:22px;line-height:1.3}
+  .presetMark{color:#ffd166}
+  .presetInfo{display:block;font-size:17px;color:#aaa;line-height:1.3;margin-top:2px}
 </style>
 </head>
 <body>
@@ -63,13 +76,15 @@
     <p>Playlist actual: <b id="setCurrent">—</b><br>Origen: <b id="setSource">—</b></p>
     <p>Pega el enlace completo de una playlist de YouTube, o solo su ID:</p>
     <input id="setInput" type="text" placeholder="https://www.youtube.com/playlist?list=PL…" autocomplete="off">
+    <h3>Listas para elegir</h3>
+    <div id="presetList"></div>
     <div>
       <button id="btnSave" class="setBtn" type="button">Guardar</button>
       <button id="btnReset" class="setBtn" type="button">Restablecer</button>
       <button id="btnClose" class="setBtn" type="button">Cerrar</button>
     </div>
     <div id="setMsg"></div>
-    <p class="setHint">Guardar aplica la playlist nueva en esta TV y la recuerda. Restablecer borra lo guardado y vuelve a la playlist por defecto (la de playlist.json). En el mando: ↑↓ mueve el foco, OK activa el botón, BACK cierra estos ajustes.</p>
+    <p class="setHint">Elige una lista de abajo o pega un enlace: al elegirla se guarda en esta TV y se aplica de inmediato. En el mando: ↑↓ mueve el foco, OK activa, BACK cierra estos ajustes.</p>
   </div>
 </div>
 <script>
@@ -112,7 +127,31 @@ var currentVideoId = ""; /* solo si el usuario guardó un video suelto (v=) */
 var playlistSource = "default"; /* "default" | "override" | "video" */
 
 var settingsOpen = false;
-var settingsFocus = 0; /* 0=input, 1=Guardar, 2=Restablecer, 3=Cerrar */
+var settingsFocus = 0; /* 0=input, 1..N=presets, N+1=Guardar, N+2=Restablecer, N+3=Cerrar */
+var statusMsg = ""; /* confirmación breve en la línea de estado (no es un error) */
+
+/* Playlists para elegir en Ajustes (todas públicas). Los IDs se copian tal
+   cual: ojo a los guiones al final (#2, #13) y a los dobles guiones (#3, #15).
+   La #1 es la lista por defecto actual (playlist.json, baladas). */
+var PRESETS = [
+  { id: "PLAciPHROzKC52lcdETGB700EDGl0B3HWM", name: "Karaoke baladas románticas en español", info: "Juan Gabriel, Luis Miguel, Alejandro Sanz · 95 videos", cat: "Español" },
+  { id: "PLAciPHROzKC5txXUwAXaKLip4gksv54y-", name: "Karaoke en español 2025-2026", info: "Shakira, Karol G, Bad Bunny, Emilia · 138 videos, 7h+", cat: "Español" },
+  { id: "PLAciPHROzKC7Ot9Hoh--ZT_68vCSdhXpm", name: "Top 100 Mejores Canciones de Karaoke en Español", info: "Luis Miguel, Shakira, Karol G, Camilo · 95 videos, 5h46m", cat: "Español" },
+  { id: "PLAciPHROzKC5UE4lLJFRqcWKpWsDLfO2_", name: "Los mejores karaokes en español", info: "Cristian Castro, Chayanne, Rosalía, Juan Gabriel · 26 videos, 1h51m", cat: "Español" },
+  { id: "PLAciPHROzKC7jyvxz09IhiEZVSsag_7CZ", name: "Mejores karaokes del año 2025-2026", info: "", cat: "Español" },
+  { id: "PLAciPHROzKC4FJs6L4ViJLG7KN4MEKO2w", name: "Karaoke Pop español éxitos (2000-2020)", info: "", cat: "Español" },
+  { id: "PL4vpDlq9AtUAiHJ0K20c0h3_rwQBlDiMm", name: "Best Karaoke Songs 2025-2026", info: "One Republic, Kaiju No 8, etc.", cat: "Inglés" },
+  { id: "PLC6z7a7kFhVvqozsF5spRwuEb9mONa8hM", name: "English Karaoke Songs With Lyrics", info: "clásicos y modernos", cat: "Inglés" },
+  { id: "PLCDCD9EA9BDDCF6EE", name: "Top Hits (English) (Yokee)", info: "", cat: "Inglés" },
+  { id: "PLAEFf3Qv8mbSOdwQa81r-0nqSWbignh9I", name: "Best Songs of 2025 (Karaoke Versions)", info: "trending del año", cat: "Inglés" },
+  { id: "PLAciPHROzKC5AlUBaM78e6SAbaM7YWc1Z", name: "Classic Spanish Karaoke", info: "", cat: "Mixto / Clásicos" },
+  { id: "PLAciPHROzKC71OqIQMiJ7PJDnyJmQTtNf", name: "Popular Spanish Karaoke Songs", info: "", cat: "Mixto / Clásicos" },
+  { id: "PLPrbHU7I7ziy6hFMvLvr1R-xvnlo_v62_", name: "Karaoke en inglés con letras traducidas al español", info: "", cat: "Mixto / Clásicos" },
+  { id: "PLVI9tQggdGtHdeK0r5OgHscTfq_SfRpvc", name: "Karaoke 31 minutos", info: "", cat: "Mixto / Clásicos" },
+  { id: "PLRorljJYG--v0R-934fO_aM3bjbmxk1-s", name: "31 minutos", info: "", cat: "Mixto / Clásicos" }
+];
+var presetRowEls = []; /* filas de presets construidas, en orden de foco */
+var presetListBuilt = false;
 
 function $(id) { return document.getElementById(id); }
 
@@ -190,6 +229,7 @@ function tryApplyPlaylist() {
 
 function applyPlaylist() {
   started = false;
+  statusMsg = ""; /* la confirmación vieja ya no aplica a la lista nueva */
   /* Nueva playlist efectiva: se resetea la racha de errores y cualquier
      salto pendiente de la playlist anterior. Pero si había un error de
      bloqueo pendiente (llegó antes del cue), se conserva: es el error
@@ -389,6 +429,7 @@ function sendStatus() {
     if (info.videoId) { html += " (" + info.videoId + ")"; }
     if (info.index !== "") { html += " · Índice: <b>" + info.index + "</b>"; }
     if (lastError) { html += ' · <span class="err">Error: ' + lastError + "</span>"; }
+    if (statusMsg) { html += ' · <span class="ok">' + statusMsg + "</span>"; }
     html += '<br><span style="font-size:15px;color:#888">Diag: lista=' +
       playlistLength() + ' videos · aplicado=' + (playlistApplied ? "sí" : "no") +
       ' · saltos=' + skipAttempts + ' · último salto: ' + (lastSkipCheck || "—") +
@@ -468,7 +509,7 @@ function onPlayerReady(event) {
 function onPlayerStateChange(event) {
   lastState = event.data;
   /* Un video que sí reproduce rompe la racha de errores seguidos. */
-  if (event.data === 1) { consecutiveErrors = 0; lastCountedVideoId = ""; }
+  if (event.data === 1) { consecutiveErrors = 0; lastCountedVideoId = ""; statusMsg = ""; }
   sendStatus();
 }
 
@@ -585,6 +626,7 @@ function onPlayerError(event) {
   lastErrorCode = code;
   lastErrorVideoId = currentInfo().videoId;
   lastError = errorText(code);
+  statusMsg = ""; /* un error nuevo manda más que la confirmación vieja */
   if (code === 100 || code === 101 || code === 150) {
     /* Video no encontrado/privado o embed no permitido: se salta solo,
        salvo que sea un video suelto guardado (ahí no hay a dónde saltar). */
@@ -769,8 +811,15 @@ function doPrev() {
 }
 
 /* ---------- Panel de Ajustes (en el SITE, no en la app) ---------- */
+/* Orden de foco en Ajustes: input, las filas de presets en orden,
+   Guardar, Restablecer, Cerrar. Los encabezados de categoría no son
+   enfocables (son solo texto). */
 function settingsElements() {
-  return [$("setInput"), $("btnSave"), $("btnReset"), $("btnClose")];
+  if (!presetListBuilt) { buildPresetList(); }
+  var els = [$("setInput")];
+  for (var i = 0; i < presetRowEls.length; i++) { els.push(presetRowEls[i]); }
+  els.push($("btnSave"), $("btnReset"), $("btnClose"));
+  return els;
 }
 
 function setSettingsMsg(txt, ok) {
@@ -790,11 +839,13 @@ function refreshSettingsPanel() {
       : (currentPlaylistId || "—");
   }
   if (src) { src.textContent = playlistSourceText(); }
+  refreshPresetActive();
 }
 
 function openSettings() {
   if (settingsOpen) { return; }
   settingsOpen = true;
+  buildPresetList();
   /* Se pausa el video al abrir los ajustes: nunca suena con el video tapado. */
   doPause();
   var panel = $("settings");
@@ -829,7 +880,16 @@ function toggleSettings() {
 function moveSettingsFocus(dir) {
   var els = settingsElements();
   settingsFocus = (settingsFocus + dir + els.length) % els.length;
-  try { els[settingsFocus].focus(); } catch (e) { /* sin foco */ }
+  try {
+    var el = els[settingsFocus];
+    if (el) {
+      el.focus();
+      /* La fila enfocada debe quedar visible dentro de la lista con scroll. */
+      if (el.className && el.className.indexOf("presetRow") !== -1 && el.scrollIntoView) {
+        el.scrollIntoView(false);
+      }
+    }
+  } catch (e) { /* sin foco */ }
 }
 
 function activateSettingsFocused() {
@@ -840,6 +900,11 @@ function activateSettingsFocused() {
   else if (el === $("btnSave")) { saveSettings(); }
   else if (el === $("btnReset")) { resetSettings(); }
   else if (el === $("btnClose")) { closeSettings(); }
+  else {
+    /* Fila de preset: su ID está en data-id. */
+    var id = el.getAttribute ? el.getAttribute("data-id") : null;
+    if (id) { selectPreset(id); }
+  }
 }
 
 /* Extrae el ID de playlist de un enlace completo o de un ID suelto.
@@ -901,6 +966,105 @@ function resetSettings() {
   applyPlaylist();
   setSettingsMsg("Listo: se borró lo guardado y volvió la playlist por defecto (" + configPlaylistId + ").", true);
   refreshSettingsPanel();
+  sendStatus();
+}
+
+/* ---------- Menú de playlists (dentro de Ajustes) ---------- */
+/* Formato de ID de playlist: "PL" + 16 a 32 caracteres. El #9 (Yokee) es
+   corto, 18 caracteres en total ("PL" + 16), y entra en el mismo rango:
+   no es un error, no se "arregla". Un ID con formato raro no se muestra
+   (la fila simplemente no se crea) para no romper la página. */
+function isValidPresetId(id) {
+  return /^PL[A-Za-z0-9_-]{16,32}$/.test(id);
+}
+
+function presetById(id) {
+  for (var i = 0; i < PRESETS.length; i++) {
+    if (PRESETS[i].id === id) { return PRESETS[i]; }
+  }
+  return null;
+}
+
+/* Construye las filas del menú (una sola vez): encabezado de categoría
+   (solo texto, no enfocable) + filas con nombre e info. Clic en una fila
+   la elige igual que OK con el mando. */
+function buildPresetList() {
+  if (presetListBuilt) { return; }
+  presetListBuilt = true;
+  var list = $("presetList");
+  if (!list) { return; }
+  var lastCat = "";
+  for (var i = 0; i < PRESETS.length; i++) {
+    var p = PRESETS[i];
+    if (!isValidPresetId(p.id)) { continue; }
+    if (p.cat !== lastCat) {
+      lastCat = p.cat;
+      var h = document.createElement("div");
+      h.className = "presetCat";
+      h.textContent = p.cat;
+      list.appendChild(h);
+    }
+    var row = document.createElement("div");
+    row.className = "presetRow";
+    row.setAttribute("data-id", p.id);
+    row.setAttribute("tabindex", "-1");
+    var nameDiv = document.createElement("div");
+    nameDiv.className = "presetName";
+    var mark = document.createElement("span");
+    mark.className = "presetMark";
+    nameDiv.appendChild(mark);
+    nameDiv.appendChild(document.createTextNode(p.name));
+    row.appendChild(nameDiv);
+    if (p.info) {
+      var infoDiv = document.createElement("div");
+      infoDiv.className = "presetInfo";
+      infoDiv.textContent = p.info;
+      row.appendChild(infoDiv);
+    }
+    (function (id) {
+      row.addEventListener("click", function () { selectPreset(id); }, false);
+    })(p.id);
+    list.appendChild(row);
+    presetRowEls.push(row);
+  }
+  refreshPresetActive();
+}
+
+/* Marca la fila de la lista activa (● delante del nombre) según la
+   playlist efectiva, y solo cuando no hay un video suelto guardado. */
+function refreshPresetActive() {
+  for (var i = 0; i < presetRowEls.length; i++) {
+    var row = presetRowEls[i];
+    var id = row.getAttribute ? row.getAttribute("data-id") : null;
+    var active = (!currentVideoId && currentPlaylistId && id === currentPlaylistId);
+    row.className = "presetRow" + (active ? " active" : "");
+    var marks = row.getElementsByClassName ? row.getElementsByClassName("presetMark") : null;
+    if (marks && marks.length > 0) { marks[0].textContent = active ? "● " : ""; }
+  }
+}
+
+/* Elige una lista del menú: se guarda como nueva lista por defecto de
+   ESTA TV (mismo mecanismo que Guardar: localStorage rokolaPlaylistId,
+   borra rokolaVideoId si había un video suelto), se aplica de inmediato
+   y se cierra el panel. La app solo renderiza la última lista elegida;
+   el usuario pulsa OK para que suene. La confirmación queda en la línea
+   de estado (statusMsg), visible al cerrarse el panel. */
+function selectPreset(id) {
+  var p = presetById(id);
+  if (!p) { return; }
+  lsSet("rokolaPlaylistId", p.id);
+  lsRemove("rokolaVideoId");
+  currentPlaylistId = p.id;
+  currentVideoId = "";
+  playlistSource = "override";
+  playlistApplied = false; /* cambió la playlist efectiva: se vuelve a aplicar */
+  lastErrorCode = 0; lastErrorVideoId = ""; lastError = ""; /* el error viejo era de la lista anterior */
+  applyPlaylist();
+  refreshSettingsPanel();
+  var input = $("setInput");
+  if (input) { input.value = "https://www.youtube.com/playlist?list=" + p.id; }
+  statusMsg = "Lista guardada: " + p.name + ". Pulsa OK para que suene.";
+  closeSettings();
   sendStatus();
 }
 
@@ -976,10 +1140,13 @@ document.addEventListener("keydown", function (e) {
 })();
 
 (function init() {
+  /* El menú de playlists se construye una sola vez al arrancar. */
+  buildPresetList();
   /* 1) playlist por defecto de playlist.json; 2) override guardado en la TV;
      3) cargar la API de YouTube. */
   loadConfig(function () {
     loadOverride();
+    refreshPresetActive(); /* la lista efectiva ya se sabe: marcar su fila */
     sendStatus();
     /* Si el reproductor ya está listo, aquí se aplica la playlist; si
        aún no lo está, lo hará onPlayerReady. tryApplyPlaylist garantiza
