@@ -10,6 +10,9 @@
      Sin autoplay: solo suena cuando llega la orden de play (tecla OK del mando).
      Videos con embed no permitido (errores 100/101/150) se saltan solos al
      siguiente, hasta 10 seguidos; el resto de errores se muestran tal cual.
+     El salto avanza por ÍNDICE ABSOLUTO (playVideoAt/cuePlaylist):
+     nextVideo() no avanza en estado -1 con el video inicial en error 150
+     (verificado en vivo 20:47 CST).
      La playlist por defecto vive en playlist.json (mismo folder); cambiar ese
      archivo en el repo cambia la playlist por defecto sin tocar el IPK.
      El usuario puede además guardar otra playlist en ESTA TV desde Ajustes.
@@ -89,8 +92,12 @@ var lastError = "";
 var lastErrorCode = 0; /* último código numérico de error de YouTube (0 = ninguno) */
 var lastErrorVideoId = ""; /* videoId del video que dio el último error */
 var consecutiveErrors = 0; /* errores 100/101/150 seguidos (videos bloqueados) */
+var lastCountedVideoId = ""; /* último video que ya sumó a la racha (anti-doble-conteo) */
 var skipTimer = null; /* temporizador del salto automático (800 ms) */
 var retryTimer = null; /* temporizador del re-chequeo si el error llegó antes del cue */
+var retryCount = 0; /* intentos del re-chequeo persistente (máx 10) */
+var skipAttempts = 0; /* saltos automáticos intentados (diagnóstico) */
+var lastSkipCheck = ""; /* resultado real del último salto (diagnóstico) */
 var apiTimer = null;
 
 /* Playlist efectiva: override guardado en esta TV > playlist.json > respaldo. */
@@ -180,6 +187,7 @@ function applyPlaylist() {
   /* Nueva playlist efectiva: se resetea la racha de errores y cualquier
      salto pendiente de la playlist anterior. */
   consecutiveErrors = 0;
+  lastCountedVideoId = "";
   lastErrorCode = 0;
   lastErrorVideoId = "";
   if (skipTimer) { clearTimeout(skipTimer); skipTimer = null; }
@@ -253,6 +261,9 @@ function sendStatus() {
     if (info.videoId) { html += " (" + info.videoId + ")"; }
     if (info.index !== "") { html += " · Índice: <b>" + info.index + "</b>"; }
     if (lastError) { html += ' · <span class="err">Error: ' + lastError + "</span>"; }
+    html += '<br><span style="font-size:15px;color:#888">Diag: lista=' +
+      playlistLength() + ' videos · aplicado=' + (playlistApplied ? "sí" : "no") +
+      ' · saltos=' + skipAttempts + ' · último salto: ' + (lastSkipCheck || "—") + '</span>';
     mini.innerHTML = html;
   }
   try {
@@ -322,8 +333,61 @@ function onPlayerReady(event) {
 function onPlayerStateChange(event) {
   lastState = event.data;
   /* Un video que sí reproduce rompe la racha de errores seguidos. */
-  if (event.data === 1) { consecutiveErrors = 0; }
+  if (event.data === 1) { consecutiveErrors = 0; lastCountedVideoId = ""; }
   sendStatus();
+}
+
+function playlistIndex() {
+  if (!player || !playerReady) { return 0; }
+  try {
+    var idx = player.getPlaylistIndex();
+    if (typeof idx === "number" && idx >= 0) { return idx; }
+  } catch (e) { /* sin índice */ }
+  return 0;
+}
+
+function playlistLength() {
+  if (!player || !playerReady) { return 0; }
+  try {
+    var list = player.getPlaylist();
+    if (list && typeof list.length === "number") { return list.length; }
+  } catch (e) { /* sin lista */ }
+  return 0;
+}
+
+/* Avance por índice absoluto dentro de la playlist.
+   nextVideo()/previousVideo() NO avanzan cuando el reproductor está sin
+   empezar (estado -1) con el video inicial en error 150 (verificado en
+   vivo 20:47 CST), así que se avanza con el índice explícito:
+   - started=true: playVideoAt(idx) carga Y reproduce ese video.
+   - started=false: cuePlaylist con index=idx solo cambia el video en
+     cola, SIN reproducir (nada de autoplay antes de que el usuario
+     pulse OK). Después se re-aplica el shuffle como en applyPlaylist. */
+function advanceToIndex(idx) {
+  if (!playerReady || !player || currentVideoId) { return false; }
+  var len = playlistLength();
+  if (len > 0) {
+    if (idx >= len) { idx = 0; }
+    if (idx < 0) { idx = len - 1; }
+  } else if (idx < 0) {
+    idx = 0;
+  }
+  try {
+    if (started) {
+      player.playVideoAt(idx);
+    } else {
+      if (!currentPlaylistId) { return false; }
+      player.cuePlaylist({ listType: "playlist", list: currentPlaylistId, index: idx });
+      window.setTimeout(function () {
+        try { player.setShuffle(true); } catch (e2) { /* shuffle opcional */ }
+      }, 1000);
+    }
+    return true;
+  } catch (e) {
+    lastError = "Al avanzar al índice " + idx + ": " + e.message;
+    sendStatus();
+    return false;
+  }
 }
 
 /* Salto automático de videos bloqueados (errores 100/101/150).
@@ -333,7 +397,14 @@ function onPlayerStateChange(event) {
 function skipBlockedVideo() {
   if (currentVideoId) { return false; }
   if (!playerReady || !player || !playlistApplied) { return false; }
-  consecutiveErrors++;
+  /* El mismo video puede disparar onError dos veces (error del videoId
+     inicial y error del cue de la playlist): la racha cuenta videos
+     bloqueados DISTINTOS, no eventos repetidos del mismo video. Sin
+     videoId conocido no se puede deducir duplicado y sí se suma. */
+  if (!lastErrorVideoId || lastErrorVideoId !== lastCountedVideoId) {
+    consecutiveErrors++;
+    lastCountedVideoId = lastErrorVideoId;
+  }
   if (consecutiveErrors > 10) {
     lastError = "Muchos videos de esta playlist no permiten embed. Prueba otra playlist en Ajustes.";
     sendStatus();
@@ -351,11 +422,16 @@ function skipBlockedVideo() {
       window.setTimeout(sendStatus, 800);
       return;
     }
-    try {
-      player.nextVideo();
-      /* Si ya estaba sonando, que siga sonando con el siguiente. */
-      if (started) { player.playVideo(); }
-    } catch (e) { /* si el salto falla, el error queda visible */ }
+    skipAttempts++;
+    advanceToIndex(playlistIndex() + 1);
+    /* Diagnóstico: comprobar 1,2 s después qué quedó realmente en cola. */
+    var n = skipAttempts;
+    window.setTimeout(function () {
+      var after = currentInfo();
+      lastSkipCheck = "salto " + n + ": idx=" + (after.index || "?") +
+        " video=" + (after.videoId || "—") + " lista=" + playlistLength();
+      sendStatus();
+    }, 1200);
     window.setTimeout(sendStatus, 800);
   }, 800);
   return true;
@@ -373,23 +449,40 @@ function onPlayerError(event) {
     if (playlistApplied) { skipBlockedVideo(); return; }
     /* El error llegó con el videoId inicial, antes de que la playlist
        se aplicara (cue): se intenta aplicar la playlist y se re-chequea
-       en 1,5 s. Normalmente el cue vuelve a disparar el mismo 150 para
-       ese video y es ese onError el que salta (y cancela este chequeo). */
+       cada 1,5 s, hasta 10 veces (retryTick). Antes era un solo disparo
+       y si a los 1,5 s la playlist aún no estaba aplicada, el salto se
+       perdía para siempre. Normalmente el cue vuelve a disparar el mismo
+       150 para ese video y es ese onError el que salta. */
     tryApplyPlaylist();
+    retryCount = 0;
     if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
-    retryTimer = window.setTimeout(function () {
-      retryTimer = null;
-      if (skipTimer) { return; } /* el salto ya está en marcha */
-      if (lastErrorCode !== 100 && lastErrorCode !== 101 && lastErrorCode !== 150) { return; }
-      var info = currentInfo();
-      if (lastErrorVideoId && info.videoId && info.videoId !== lastErrorVideoId) { return; }
-      skipBlockedVideo();
-    }, 1500);
+    retryTimer = window.setTimeout(retryTick, 1500);
     sendStatus();
     return;
   }
   /* Errores 2, 5, 153 y demás: se muestran tal cual, sin salto automático. */
   sendStatus();
+}
+
+/* Re-chequeo persistente del error que llegó antes del cue: cada 1,5 s
+   intenta aplicar la playlist y saltar, hasta 10 intentos (15 s).
+   Se cancela si ya hay un salto en marcha, si el video actual cambió
+   o si el error ya no es de bloqueo. */
+function retryTick() {
+  retryTimer = null;
+  if (skipTimer) { return; } /* el salto ya está en marcha */
+  if (lastErrorCode !== 100 && lastErrorCode !== 101 && lastErrorCode !== 150) { return; }
+  var info = currentInfo();
+  if (lastErrorVideoId && info.videoId && info.videoId !== lastErrorVideoId) { return; }
+  retryCount++;
+  if (retryCount > 10) { return; }
+  tryApplyPlaylist();
+  if (playlistApplied) {
+    skipBlockedVideo();
+  } else {
+    /* La playlist aún no está aplicada: se reintenta en 1,5 s. */
+    retryTimer = window.setTimeout(retryTick, 1500);
+  }
 }
 
 /* ¿El video actual es el que dio el último error de bloqueo? El código
@@ -410,15 +503,10 @@ function playFromCurrent() {
   if (currentVideoId) { player.playVideo(); return; }
   if (currentVideoBlocked()) {
     /* El avance manual cancela el salto automático pendiente del mismo
-       error, para no saltar dos videos. */
+       error, para no saltar dos videos. started ya es true en este
+       camino, así que advanceToIndex reproduce el siguiente. */
     if (skipTimer) { clearTimeout(skipTimer); skipTimer = null; }
-    try { player.nextVideo(); } catch (e) { /* se intenta reproducir igual */ }
-    window.setTimeout(function () {
-      try { player.playVideo(); } catch (e2) {
-        lastError = "Al reproducir: " + e2.message;
-        sendStatus();
-      }
-    }, 400);
+    advanceToIndex(playlistIndex() + 1);
     return;
   }
   player.playVideoAt(0);
@@ -483,12 +571,20 @@ function doPause() {
 
 function doNext() {
   if (!playerReady || !player) { return false; }
-  try { player.nextVideo(); return true; } catch (e) { return false; }
+  try {
+    if (currentVideoId) { player.playVideo(); return true; }
+    advanceToIndex(playlistIndex() + 1);
+    return true;
+  } catch (e) { return false; }
 }
 
 function doPrev() {
   if (!playerReady || !player) { return false; }
-  try { player.previousVideo(); return true; } catch (e) { return false; }
+  try {
+    if (currentVideoId) { player.playVideo(); return true; }
+    advanceToIndex(playlistIndex() - 1);
+    return true;
+  } catch (e) { return false; }
 }
 
 /* ---------- Panel de Ajustes (en el SITE, no en la app) ---------- */
