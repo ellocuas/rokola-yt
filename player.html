@@ -80,6 +80,8 @@ var player = null;
 var apiLoaded = false;
 var playerReady = false;
 var started = false;
+var playlistApplied = false; /* true cuando la playlist efectiva ya se aplicó (cue hecho) */
+var playPending = false; /* true mientras espera el play diferido de doPlay */
 var lastState = -1;
 var lastError = "";
 var apiTimer = null;
@@ -111,8 +113,12 @@ function lsRemove(key) {
 
 /* ---------- playlist por defecto: playlist.json (XHR, ES5, sin fetch) ---------- */
 function loadConfig(done) {
+  /* "Cargada" = el intento terminó (con playlist.json o con el respaldo).
+     Sin esto, si playlist.json falla, configLoaded quedaría en false para
+     siempre y la playlist no se aplicaría nunca. */
+  function finish() { configLoaded = true; if (done) { done(); } }
   var xhr;
-  try { xhr = new XMLHttpRequest(); } catch (e) { if (done) { done(); } return; }
+  try { xhr = new XMLHttpRequest(); } catch (e) { finish(); return; }
   xhr.onreadystatechange = function () {
     if (xhr.readyState !== 4) { return; }
     if (xhr.status === 200 || xhr.status === 0) {
@@ -120,15 +126,14 @@ function loadConfig(done) {
         var cfg = JSON.parse(xhr.responseText);
         if (cfg && cfg.playlistId) { configPlaylistId = cfg.playlistId; }
         if (cfg && cfg.firstVideoId) { configFirstVideoId = cfg.firstVideoId; }
-        configLoaded = true;
       } catch (e2) { /* JSON roto: se queda el respaldo */ }
     }
-    if (done) { done(); }
+    finish();
   };
   try {
     xhr.open("GET", "playlist.json", true);
     xhr.send(null);
-  } catch (e3) { if (done) { done(); } }
+  } catch (e3) { finish(); }
 }
 
 function loadOverride() {
@@ -149,7 +154,20 @@ function loadOverride() {
   }
 }
 
-/* Aplica la playlist efectiva al reproductor (si ya está listo). */
+/* Aplica la playlist efectiva al reproductor (si ya está listo).
+   GUARDA ANTI-DOBLE-CUE: la playlist solo se aplica UNA vez por cada
+   playlist efectiva. Antes, onPlayerReady y el callback de loadConfig
+   podían llamar a cuePlaylist dos veces seguidas y el segundo cue
+   interrumpía al primero, dejando el reproductor vacío (error 2 al
+   darle play). playlistApplied se resetea solo cuando cambia la
+   playlist efectiva (Guardar / Restablecer). */
+function tryApplyPlaylist() {
+  if (!playerReady || !player) { return; }
+  if (!configLoaded) { return; }
+  if (playlistApplied) { return; }
+  applyPlaylist();
+}
+
 function applyPlaylist() {
   started = false;
   if (!playerReady || !player) { sendStatus(); return; }
@@ -162,6 +180,7 @@ function applyPlaylist() {
         try { player.setShuffle(true); } catch (e2) { /* shuffle opcional */ }
       }, 1000);
     }
+    playlistApplied = true;
   } catch (e) {
     lastError = "Al cargar la playlist: " + e.message;
   }
@@ -252,9 +271,13 @@ function onYouTubeIframeAPIReady() {
   if (apiTimer) { clearTimeout(apiTimer); apiTimer = null; }
   sendStatus();
   try {
+    /* videoId desde el inicio: el embed nunca arranca vacío. Antes se
+       creaba sin videoId y si el cue de la playlist se interrumpía, el
+       reproductor quedaba sin nada que reproducir (error 2 al darle play). */
     player = new YT.Player("ytplayer", {
       height: "720",
       width: "1280",
+      videoId: configFirstVideoId,
       playerVars: { rel: 0, modestbranding: 1, playsinline: 1, origin: window.location.origin },
       events: {
         onReady: onPlayerReady,
@@ -275,7 +298,10 @@ function onPlayerReady(event) {
     if (fr && fr.setAttribute) { fr.setAttribute("referrerpolicy", "strict-origin-when-cross-origin"); }
   } catch (e0) { /* no es crítico */ }
   sendStatus();
-  applyPlaylist();
+  /* Si playlist.json aún no cargó, NO se aplica todavía: lo hará el
+     callback de loadConfig cuando termine. tryApplyPlaylist lo impide
+     de todos modos (configLoaded), pero aquí queda explícito. */
+  tryApplyPlaylist();
   window.setTimeout(sendStatus, 2000);
 }
 
@@ -294,6 +320,29 @@ function doPlay() {
   if (!playerReady || !player) { return false; }
   try {
     if (!started) {
+      if (!playlistApplied) {
+        /* La playlist aún no está aplicada (config lenta o play muy
+           temprano): se aplica ahora y se espera ~400 ms a que el cue
+           cargue antes de reproducir. El reproductor ya tiene videoId,
+           así que aunque el cue tardara, playVideoAt(0) tiene un video
+           válido y no da error 2. */
+        if (playPending) { return true; }
+        playPending = true;
+        tryApplyPlaylist();
+        window.setTimeout(function () {
+          playPending = false;
+          try {
+            started = true;
+            /* playVideoAt(0) tras setShuffle aplica el reorden aleatorio. */
+            if (currentVideoId) { player.playVideo(); }
+            else { player.playVideoAt(0); }
+          } catch (e2) {
+            lastError = "Al reproducir: " + e2.message;
+            sendStatus();
+          }
+        }, 400);
+        return true;
+      }
       started = true;
       /* playVideoAt(0) tras setShuffle aplica el reorden aleatorio. */
       if (currentVideoId) { player.playVideo(); }
@@ -440,6 +489,7 @@ function saveSettings() {
     currentPlaylistId = res.playlistId;
     currentVideoId = "";
     playlistSource = "override";
+    playlistApplied = false; /* cambió la playlist efectiva: se vuelve a aplicar */
     applyPlaylist();
     setSettingsMsg("Playlist guardada en esta TV: " + res.playlistId + ". Ya está sonando en aleatorio con OK.", true);
     refreshSettingsPanel();
@@ -449,6 +499,7 @@ function saveSettings() {
     currentVideoId = res.videoId;
     currentPlaylistId = "";
     playlistSource = "video";
+    playlistApplied = false; /* cambió la playlist efectiva: se vuelve a aplicar */
     applyPlaylist();
     setSettingsMsg("Ojo: eso no era una playlist, era un solo video. Se guardó ese video (" + res.videoId + ") y se reproduce solo. Para una playlist, pega un enlace con list=…", true);
     refreshSettingsPanel();
@@ -462,6 +513,7 @@ function resetSettings() {
   currentPlaylistId = configPlaylistId;
   currentVideoId = "";
   playlistSource = "default";
+  playlistApplied = false; /* cambió la playlist efectiva: se vuelve a aplicar */
   applyPlaylist();
   setSettingsMsg("Listo: se borró lo guardado y volvió la playlist por defecto (" + configPlaylistId + ").", true);
   refreshSettingsPanel();
@@ -545,7 +597,10 @@ document.addEventListener("keydown", function (e) {
   loadConfig(function () {
     loadOverride();
     sendStatus();
-    if (playerReady) { applyPlaylist(); }
+    /* Si el reproductor ya está listo, aquí se aplica la playlist; si
+       aún no lo está, lo hará onPlayerReady. tryApplyPlaylist garantiza
+       que solo se aplique una vez entre los dos. */
+    tryApplyPlaylist();
   });
 
   var tag = document.createElement("script");
