@@ -117,6 +117,10 @@ var shuffleChecks = 0; /* revisiones hechas esperando a que cargue la lista */
 var watchTimer = null; /* temporizador del vigilante de carga de lista (2 s) */
 var watchChecks = 0; /* revisiones del vigilante desde su último arranque */
 var recueCount = 0; /* re-cues hechos por el vigilante (máx 3 por playlist efectiva) */
+var cuePrevVideoId = ""; /* video en cola cuando se emitió el último cue */
+var cuePrevLength = 0; /* longitud de la lista cargada cuando se emitió el último cue */
+var cueTargetId = ""; /* playlist pedida en el último cue */
+var loadedPlaylistId = ""; /* última playlist confirmada como cargada */
 var skipAttempts = 0; /* saltos automáticos intentados (diagnóstico) */
 var lastSkipCheck = ""; /* resultado real del último salto (diagnóstico) */
 var apiTimer = null;
@@ -227,6 +231,39 @@ function tryApplyPlaylist() {
   applyPlaylist();
 }
 
+/* Foto del reproductor justo ANTES de emitir un cue: el video en cola y
+   la longitud de la lista que hay cargada en ese momento. Sirve para
+   saber si la lista NUEVA llegó de verdad o si el cue se perdió y sigue
+   la lista VIEJA. En un cambio a mitad de sesión la lista vieja sigue
+   cargada (length > 0), así que "hay lista" NO basta: hay que comparar
+   con la foto. En arranque en frío la foto es length 0 y sin video, así
+   que cualquier lista que llegue ya es un cambio. Se toma en applyPlaylist
+   y en recuePlaylist, siempre ANTES de llamar a cuePlaylist. */
+function takeCueSnapshot() {
+  cueTargetId = currentPlaylistId;
+  cuePrevLength = playlistLength();
+  cuePrevVideoId = "";
+  var info = currentInfo();
+  if (info.videoId) { cuePrevVideoId = info.videoId; }
+}
+
+/* ¿La lista cargada ahora es DISTINTA de la foto del último cue? Cambia
+   si la longitud es distinta O si el video en cola es distinto. Si el
+   video de la foto era desconocido (""), solo cuenta la longitud.
+   También cuenta como cargada si la lista pedida ya era la última
+   confirmada como cargada (mismo ID y hay lista): volver a pedir la
+   misma playlist no cambia ni el video ni la longitud, y sin esto el
+   vigilante la daría por perdida y el shuffle no se aplicaría nunca. */
+function listChanged() {
+  if (cueTargetId && cueTargetId === loadedPlaylistId && playlistLength() > 0) { return true; }
+  if (playlistLength() !== cuePrevLength) { return true; }
+  if (cuePrevVideoId) {
+    var cur = currentInfo().videoId;
+    if (cur && cur !== cuePrevVideoId) { return true; }
+  }
+  return false;
+}
+
 function applyPlaylist() {
   started = false;
   statusMsg = ""; /* la confirmación vieja ya no aplica a la lista nueva */
@@ -251,6 +288,7 @@ function applyPlaylist() {
   watchChecks = 0;
   if (watchTimer) { clearTimeout(watchTimer); watchTimer = null; }
   if (!playerReady || !player) { sendStatus(); return; }
+  takeCueSnapshot(); /* foto ANTES del cue: video y longitud de la lista vieja */
   try {
     if (currentVideoId) {
       player.cueVideoById(currentVideoId);
@@ -262,8 +300,9 @@ function applyPlaylist() {
   } catch (e) {
     lastError = "Al cargar la playlist: " + e.message;
   }
-  /* El vigilante observa si la lista llega a cargar: si el cue se pierde,
-     él lo re-emite. Solo para playlists (un video suelto no tiene lista). */
+  /* El vigilante observa si la lista NUEVA llega a cargar: si el cue se
+     pierde y sigue la lista vieja (o no hay lista), él lo re-emite. Solo
+     para playlists (un video suelto no tiene lista). */
   if (!currentVideoId) { startWatchdog(); }
   if (!currentVideoId &&
       (pendingErrorCode === 100 || pendingErrorCode === 101 || pendingErrorCode === 150)) {
@@ -282,10 +321,12 @@ function applyPlaylist() {
 
 /* Re-emite el cue completo de la playlist efectiva (sin índice) y
    re-aplica el shuffle. Se usa cuando el cue ya se hizo pero la lista
-   no llegó a cargar (getPlaylist() vacío): un cue con índice no tiene
-   a dónde ir y hay que volver a pedir la lista entera. */
+   nueva no llegó a cargar: getPlaylist() vacío, o sigue la lista VIEJA
+   (el cue se perdió). Un cue con índice no tiene a dónde ir y hay que
+   volver a pedir la lista entera. */
 function recuePlaylist() {
   if (!playerReady || !player || currentVideoId || !currentPlaylistId) { return false; }
+  takeCueSnapshot(); /* foto ANTES del re-cue: video y longitud de la lista vieja */
   try {
     player.cuePlaylist({ listType: "playlist", list: currentPlaylistId });
     scheduleShuffle();
@@ -310,10 +351,15 @@ var WATCHDOG_MSG = "La playlist no cargó en este navegador (lista vacía tras 3
    responde), nada lo reintentaba en el camino sin errores: la lista
    quedaba en 0 para siempre y OK no hacía nada (verificado en vivo
    22:07-22:10 CST: lista=0 a los 150 s, sin error, cue con el ID
-   correcto). El vigilante revisa cada 2 s si getPlaylist() ya tiene
-   videos; si sigue vacía, re-emite el cue (máx 3 veces, con 4 s entre
-   re-cues). A los ~30 s sin cargar se detiene con el mensaje visible
-   y el reproductor queda en pausa, sin reproducir solo. Se cancela en
+   correcto). El vigilante revisa cada 2 s si la lista NUEVA ya cargó
+   (listChanged: video o longitud distintos de la foto del cue); si
+   sigue vacía O sigue la lista VIEJA, re-emite el cue (máx 3 veces,
+   con 4 s entre re-cues). Antes solo miraba si había lista (length > 0),
+   así que en un cambio a mitad de sesión veía la lista vieja (50) y se
+   detenía creyendo que la nueva había cargado (verificado en vivo
+   23:11-23:18 CST: lista=50 y video viejo 145 s después de elegir otra
+   lista). A los ~30 s sin cambio se detiene con el mensaje visible y el
+   reproductor queda en pausa, sin reproducir solo. Se cancela en
    applyPlaylist() al cambiar la playlist efectiva, y cuando la lista
    carga. */
 function startWatchdog() {
@@ -324,9 +370,10 @@ function startWatchdog() {
 
 function watchPlaylist() {
   if (!playerReady || !player || currentVideoId) { watchTimer = null; return; }
-  if (playlistLength() > 0) {
-    /* La lista cargó: el vigilante se detiene. Si quedó el mensaje de
+  if (listChanged()) {
+    /* La lista NUEVA cargó: el vigilante se detiene. Si quedó el mensaje de
        un intento anterior, se borra (ya no aplica). */
+    loadedPlaylistId = cueTargetId;
     watchTimer = null;
     if (lastError === WATCHDOG_MSG) { lastError = ""; }
     sendStatus();
@@ -348,16 +395,23 @@ function watchPlaylist() {
   sendStatus();
 }
 
-/* Shuffle DIFERIDO: setShuffle(true) solo cuando la lista ya cargó.
+/* Shuffle DIFERIDO: setShuffle(true) solo cuando la lista NUEVA ya cargó.
    Antes se llamaba a los 1000 ms del cue, cuando la playlist todavía
    estaba cargando, y ese shuffle sobre una lista aún vacía podía
    interrumpir o cancelar la carga pendiente (verificado en vivo
    21:42-21:45 CST: cue con el ID correcto, aplicado=sí, pero lista=0
-   incluso 70 s después). Ahora se revisa cada 500 ms: en cuanto
-   playlistLength() > 0 se aplica el shuffle UNA vez; si a los 10 s la
-   lista sigue vacía, se deja de intentar (la lista se reproduce sin
-   aleatorizar, pero se reproduce). Se cancela en applyPlaylist()
-   cuando cambia la playlist efectiva, como skipTimer/retryTimer. */
+   incluso 70 s después). Después se revisaba cada 500 ms y se aplicaba
+   en cuanto playlistLength() > 0, pero eso falla en un cambio a mitad de
+   sesión: la lista VIEJA sigue cargada (length > 0), así que el shuffle
+   se disparaba a los ~500 ms del cue, en plena carga de la lista nueva,
+   y la carga se perdía (verificado en vivo 23:11-23:18 CST: lista=50 y
+   video viejo 145 s después de elegir otra lista, con el cue ya hecho).
+   Ahora se revisa cada 500 ms con listChanged(): solo se aplica cuando
+   el video en cola o la longitud son distintos de la foto del cue, o sea
+   cuando la lista nueva llegó de verdad; si a los 10 s no hay cambio, se
+   deja de intentar (la lista se reproduce sin aleatorizar, pero se
+   reproduce). Se cancela en applyPlaylist() cuando cambia la playlist
+   efectiva, como skipTimer/retryTimer. */
 function scheduleShuffle() {
   if (shuffleTimer) { clearTimeout(shuffleTimer); shuffleTimer = null; }
   if (currentVideoId || !currentPlaylistId) { return; }
@@ -368,7 +422,10 @@ function scheduleShuffle() {
 function shuffleTick() {
   shuffleTimer = null;
   if (!playerReady || !player || currentVideoId) { return; }
-  if (playlistLength() > 0) {
+  if (listChanged()) {
+    /* La lista NUEVA ya cargó: ahora sí se puede aleatorizar sin
+       interrumpir la carga pendiente. */
+    loadedPlaylistId = cueTargetId;
     try { player.setShuffle(true); } catch (e) { /* shuffle opcional */ }
     return;
   }
