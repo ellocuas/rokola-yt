@@ -1,0 +1,569 @@
+<!doctype html>
+<!-- Rokola YT — página alojada (GitHub Pages: https://ellocuas.github.io/rokola-yt/).
+     Esta es la paginita en un dominio https REAL que embebe el reproductor
+     de YouTube. La app webOS (file://) solo la enmarca con un iframe.
+     YouTube entonces ve este dominio como embedder y recibe un Referer
+     válido, que es justo lo que faltaba y causaba el Error 153.
+     El video se reproduce SIEMPRE visible (1280x720), nunca oculto ni tapado:
+     el panel de Ajustes solo se abre cuando el usuario lo pide y al abrirse
+     se pausa el video, así nunca suena audio con el video tapado.
+     Sin autoplay: solo suena cuando llega la orden de play (tecla OK del mando).
+     La playlist por defecto vive en playlist.json (mismo folder); cambiar ese
+     archivo en el repo cambia la playlist por defecto sin tocar el IPK.
+     El usuario puede además guardar otra playlist en ESTA TV desde Ajustes.
+     Sintaxis ES5 a propósito (Chromium viejo de webOS Hub). -->
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<title>Rokola YT — Reproductor</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#000;color:#fff;font-family:Arial,Helvetica,sans-serif;font-size:20px}
+  #wrap{width:1280px;max-width:100%;margin:0 auto;text-align:center;position:relative}
+  #ytplayer{background:#000}
+  #ytplayer iframe{width:1280px;height:720px;max-width:100%;border:0;display:block;margin:0 auto}
+  #miniBar{padding:10px 14px;font-size:18px;color:#b9b9d6;text-align:left;line-height:1.4;word-break:break-all}
+  #miniBar b{color:#ffd166}
+  #miniBar .err{color:#ff8080}
+  #btnSettings{float:right;background:#1c1c2e;color:#ffd166;border:2px solid #ff2e88;border-radius:8px;padding:6px 16px;font-size:18px;cursor:pointer}
+  #btnSettings:focus{outline:3px solid #ffd166}
+  /* Panel de Ajustes: oculto por defecto, NO tapa el video cuando está
+     cerrado. Al abrirse cubre el reproductor, pero el video se pausa antes,
+     así que nunca hay audio con el video tapado. */
+  #settings{display:none;position:absolute;left:0;top:0;width:1280px;max-width:100%;min-height:760px;background:rgba(8,8,18,0.98);padding:36px 48px;text-align:left;z-index:10}
+  #settings.open{display:block}
+  #settings h2{font-size:32px;color:#ffd166;margin-bottom:14px}
+  #settings p{font-size:20px;line-height:1.5;color:#ddd;margin-bottom:12px;word-break:break-all}
+  #settings p b{color:#ffd166}
+  #setInput{width:100%;padding:14px;font-size:22px;border:3px solid #00c2ff;border-radius:10px;background:#fff;color:#000;margin:8px 0 16px}
+  #setInput:focus{outline:3px solid #ffd166}
+  .setBtn{display:inline-block;background:#1c1c2e;color:#fff;border:2px solid #00c2ff;border-radius:10px;padding:12px 26px;font-size:22px;margin-right:14px;cursor:pointer}
+  .setBtn:focus{outline:3px solid #ffd166;background:#14202e}
+  #btnSave{border-color:#2ecc71}
+  #btnReset{border-color:#ff9800}
+  #setMsg{margin-top:18px;font-size:20px;line-height:1.5;min-height:30px}
+  #setMsg.ok{color:#7dffb0}
+  #setMsg.err{color:#ff8080}
+  .setHint{margin-top:18px;font-size:18px;color:#aaa;line-height:1.5}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="ytplayer"></div>
+  <div id="miniBar"><button id="btnSettings" type="button">Ajustes</button><span id="mini">Cargando la API de YouTube…</span></div>
+
+  <div id="settings">
+    <h2>Ajustes — Playlist</h2>
+    <p>Playlist actual: <b id="setCurrent">—</b><br>Origen: <b id="setSource">—</b></p>
+    <p>Pega el enlace completo de una playlist de YouTube, o solo su ID:</p>
+    <input id="setInput" type="text" placeholder="https://www.youtube.com/playlist?list=PL…" autocomplete="off">
+    <div>
+      <button id="btnSave" class="setBtn" type="button">Guardar</button>
+      <button id="btnReset" class="setBtn" type="button">Restablecer</button>
+      <button id="btnClose" class="setBtn" type="button">Cerrar</button>
+    </div>
+    <div id="setMsg"></div>
+    <p class="setHint">Guardar aplica la playlist nueva en esta TV y la recuerda. Restablecer borra lo guardado y vuelve a la playlist por defecto (la de playlist.json). En el mando: ↑↓ mueve el foco, OK activa el botón, BACK cierra estos ajustes.</p>
+  </div>
+</div>
+<script>
+/* Playlist por defecto de RESPALDO (si playlist.json no carga). La playlist
+   por defecto real vive en playlist.json, junto a este archivo. */
+var DEFAULT_PLAYLIST_ID = "PL8D4Iby0Bmm_bzfry9RoauLHVgxWllGuz";
+var DEFAULT_FIRST_VIDEO_ID = "xpha1FmOjLA";
+var configPlaylistId = DEFAULT_PLAYLIST_ID;
+var configFirstVideoId = DEFAULT_FIRST_VIDEO_ID;
+var configLoaded = false;
+
+var player = null;
+var apiLoaded = false;
+var playerReady = false;
+var started = false;
+var lastState = -1;
+var lastError = "";
+var apiTimer = null;
+
+/* Playlist efectiva: override guardado en esta TV > playlist.json > respaldo. */
+var currentPlaylistId = DEFAULT_PLAYLIST_ID;
+var currentVideoId = ""; /* solo si el usuario guardó un video suelto (v=) */
+var playlistSource = "default"; /* "default" | "override" | "video" */
+
+var settingsOpen = false;
+var settingsFocus = 0; /* 0=input, 1=Guardar, 2=Restablecer, 3=Cerrar */
+
+function $(id) { return document.getElementById(id); }
+
+/* ---------- localStorage con try/catch (puede no existir en la TV) ---------- */
+function lsGet(key) {
+  try { return window.localStorage ? window.localStorage.getItem(key) : null; }
+  catch (e) { return null; }
+}
+function lsSet(key, val) {
+  try { if (window.localStorage) { window.localStorage.setItem(key, val); return true; } }
+  catch (e) { /* sin almacenamiento */ }
+  return false;
+}
+function lsRemove(key) {
+  try { if (window.localStorage) { window.localStorage.removeItem(key); } }
+  catch (e) { /* sin almacenamiento */ }
+}
+
+/* ---------- playlist por defecto: playlist.json (XHR, ES5, sin fetch) ---------- */
+function loadConfig(done) {
+  var xhr;
+  try { xhr = new XMLHttpRequest(); } catch (e) { if (done) { done(); } return; }
+  xhr.onreadystatechange = function () {
+    if (xhr.readyState !== 4) { return; }
+    if (xhr.status === 200 || xhr.status === 0) {
+      try {
+        var cfg = JSON.parse(xhr.responseText);
+        if (cfg && cfg.playlistId) { configPlaylistId = cfg.playlistId; }
+        if (cfg && cfg.firstVideoId) { configFirstVideoId = cfg.firstVideoId; }
+        configLoaded = true;
+      } catch (e2) { /* JSON roto: se queda el respaldo */ }
+    }
+    if (done) { done(); }
+  };
+  try {
+    xhr.open("GET", "playlist.json", true);
+    xhr.send(null);
+  } catch (e3) { if (done) { done(); } }
+}
+
+function loadOverride() {
+  var ov = lsGet("rokolaPlaylistId");
+  var vid = lsGet("rokolaVideoId");
+  if (vid) {
+    currentVideoId = vid;
+    currentPlaylistId = "";
+    playlistSource = "video";
+  } else if (ov) {
+    currentPlaylistId = ov;
+    currentVideoId = "";
+    playlistSource = "override";
+  } else {
+    currentPlaylistId = configPlaylistId;
+    currentVideoId = "";
+    playlistSource = "default";
+  }
+}
+
+/* Aplica la playlist efectiva al reproductor (si ya está listo). */
+function applyPlaylist() {
+  started = false;
+  if (!playerReady || !player) { sendStatus(); return; }
+  try {
+    if (currentVideoId) {
+      player.cueVideoById(currentVideoId);
+    } else {
+      player.cuePlaylist({ listType: "playlist", list: currentPlaylistId });
+      window.setTimeout(function () {
+        try { player.setShuffle(true); } catch (e2) { /* shuffle opcional */ }
+      }, 1000);
+    }
+  } catch (e) {
+    lastError = "Al cargar la playlist: " + e.message;
+  }
+  window.setTimeout(sendStatus, 1500);
+}
+
+function stateName(code) {
+  if (code === -1) { return "sin empezar (-1)"; }
+  if (code === 0) { return "terminado (0)"; }
+  if (code === 1) { return "reproduciendo (1)"; }
+  if (code === 2) { return "en pausa (2)"; }
+  if (code === 3) { return "cargando / buffering (3)"; }
+  if (code === 5) { return "video en cola (5)"; }
+  return "desconocido (" + code + ")";
+}
+
+function errorText(code) {
+  if (code === 2) { return "2 = parámetro no válido (ID de video o playlist mal formado)"; }
+  if (code === 5) { return "5 = error del reproductor HTML5"; }
+  if (code === 100) { return "100 = video no encontrado o privado"; }
+  if (code === 101) { return "101 = el dueño no permite reproducir este video embebido"; }
+  if (code === 150) { return "150 = igual que 101: embed no permitido por el dueño"; }
+  if (code === 153) { return "153 = falta Referer/origen: YouTube no sabe quién lo está embebiendo"; }
+  return "código " + code;
+}
+
+function currentInfo() {
+  var info = { videoId: "", title: "", index: "" };
+  if (player && playerReady) {
+    try {
+      var data = player.getVideoData();
+      if (data) {
+        if (data.video_id) { info.videoId = data.video_id; }
+        if (data.title) { info.title = data.title; }
+      }
+      var idx = player.getPlaylistIndex();
+      if (idx !== null && idx !== undefined) { info.index = String(idx); }
+    } catch (e) { /* sin info, se reporta vacía */ }
+  }
+  return info;
+}
+
+function playlistSourceText() {
+  if (playlistSource === "override") { return "guardada en esta TV"; }
+  if (playlistSource === "video") { return "video suelto guardado en esta TV"; }
+  return "por defecto";
+}
+
+function sendStatus() {
+  var info = currentInfo();
+  var mini = $("mini");
+  if (mini) {
+    var html = "API: <b>" + (apiLoaded ? "sí" : "no") + "</b> · Listo: <b>" +
+      (playerReady ? "sí" : "no") + "</b> · Estado: <b>" + stateName(lastState) + "</b>";
+    if (info.title) { html += " · Video: <b>" + info.title + "</b>"; }
+    if (info.videoId) { html += " (" + info.videoId + ")"; }
+    if (info.index !== "") { html += " · Índice: <b>" + info.index + "</b>"; }
+    if (lastError) { html += ' · <span class="err">Error: ' + lastError + "</span>"; }
+    mini.innerHTML = html;
+  }
+  try {
+    window.parent.postMessage({
+      type: "yt-status",
+      apiLoaded: apiLoaded,
+      ready: playerReady,
+      state: lastState,
+      stateText: stateName(lastState),
+      videoId: info.videoId,
+      title: info.title,
+      index: info.index,
+      error: lastError,
+      errorText: lastError,
+      playlistId: currentPlaylistId || currentVideoId,
+      playlistSource: playlistSource,
+      firstVideoId: configFirstVideoId
+    }, "*");
+  } catch (e) { /* el padre no escucha todavía */ }
+}
+
+function sendBack(handled) {
+  try {
+    window.parent.postMessage({ type: "yt-back", handled: handled }, "*");
+  } catch (e) { /* sin padre */ }
+}
+
+function onYouTubeIframeAPIReady() {
+  apiLoaded = true;
+  if (apiTimer) { clearTimeout(apiTimer); apiTimer = null; }
+  sendStatus();
+  try {
+    player = new YT.Player("ytplayer", {
+      height: "720",
+      width: "1280",
+      playerVars: { rel: 0, modestbranding: 1, playsinline: 1, origin: window.location.origin },
+      events: {
+        onReady: onPlayerReady,
+        onStateChange: onPlayerStateChange,
+        onError: onPlayerError
+      }
+    });
+  } catch (e) {
+    lastError = "Al crear el reproductor: " + e.message;
+    sendStatus();
+  }
+}
+
+function onPlayerReady(event) {
+  playerReady = true;
+  try {
+    var fr = document.getElementById("ytplayer");
+    if (fr && fr.setAttribute) { fr.setAttribute("referrerpolicy", "strict-origin-when-cross-origin"); }
+  } catch (e0) { /* no es crítico */ }
+  sendStatus();
+  applyPlaylist();
+  window.setTimeout(sendStatus, 2000);
+}
+
+function onPlayerStateChange(event) {
+  lastState = event.data;
+  sendStatus();
+}
+
+function onPlayerError(event) {
+  var code = event.data;
+  lastError = errorText(code);
+  sendStatus();
+}
+
+function doPlay() {
+  if (!playerReady || !player) { return false; }
+  try {
+    if (!started) {
+      started = true;
+      /* playVideoAt(0) tras setShuffle aplica el reorden aleatorio. */
+      if (currentVideoId) { player.playVideo(); }
+      else { player.playVideoAt(0); }
+    } else {
+      player.playVideo();
+    }
+    return true;
+  } catch (e) {
+    lastError = "Al reproducir: " + e.message;
+    sendStatus();
+    return false;
+  }
+}
+
+function doToggle() {
+  if (!playerReady || !player) { return false; }
+  try {
+    if (!started) { return doPlay(); }
+    var st = player.getPlayerState();
+    if (st === 1) { player.pauseVideo(); } else { player.playVideo(); }
+    return true;
+  } catch (e) {
+    lastError = "Al cambiar pausa/reproducir: " + e.message;
+    sendStatus();
+    return false;
+  }
+}
+
+function doPause() {
+  if (!playerReady || !player) { return false; }
+  try { player.pauseVideo(); return true; } catch (e) { return false; }
+}
+
+function doNext() {
+  if (!playerReady || !player) { return false; }
+  try { player.nextVideo(); return true; } catch (e) { return false; }
+}
+
+function doPrev() {
+  if (!playerReady || !player) { return false; }
+  try { player.previousVideo(); return true; } catch (e) { return false; }
+}
+
+/* ---------- Panel de Ajustes (en el SITE, no en la app) ---------- */
+function settingsElements() {
+  return [$("setInput"), $("btnSave"), $("btnReset"), $("btnClose")];
+}
+
+function setSettingsMsg(txt, ok) {
+  var m = $("setMsg");
+  if (m) {
+    m.textContent = txt;
+    m.className = ok ? "ok" : "err";
+    m.id = "setMsg";
+  }
+}
+
+function refreshSettingsPanel() {
+  var cur = $("setCurrent");
+  var src = $("setSource");
+  if (cur) {
+    cur.textContent = currentVideoId ? ("video " + currentVideoId)
+      : (currentPlaylistId || "—");
+  }
+  if (src) { src.textContent = playlistSourceText(); }
+}
+
+function openSettings() {
+  if (settingsOpen) { return; }
+  settingsOpen = true;
+  /* Se pausa el video al abrir los ajustes: nunca suena con el video tapado. */
+  doPause();
+  var panel = $("settings");
+  if (panel) { panel.className = "open"; panel.id = "settings"; }
+  refreshSettingsPanel();
+  setSettingsMsg("", true);
+  var input = $("setInput");
+  if (input) {
+    input.value = currentVideoId
+      ? ("https://www.youtube.com/watch?v=" + currentVideoId)
+      : ("https://www.youtube.com/playlist?list=" + currentPlaylistId);
+    settingsFocus = 0;
+    try { input.focus(); input.select(); } catch (e) { /* sin foco */ }
+  }
+  sendStatus();
+}
+
+function closeSettings() {
+  if (!settingsOpen) { return; }
+  settingsOpen = false;
+  var panel = $("settings");
+  if (panel) { panel.className = ""; panel.id = "settings"; }
+  var input = $("setInput");
+  try { if (input) { input.blur(); } } catch (e) { /* sin foco */ }
+  sendStatus();
+}
+
+function toggleSettings() {
+  if (settingsOpen) { closeSettings(); } else { openSettings(); }
+}
+
+function moveSettingsFocus(dir) {
+  var els = settingsElements();
+  settingsFocus = (settingsFocus + dir + els.length) % els.length;
+  try { els[settingsFocus].focus(); } catch (e) { /* sin foco */ }
+}
+
+function activateSettingsFocused() {
+  var els = settingsElements();
+  var el = els[settingsFocus];
+  if (!el) { return; }
+  if (el === $("setInput")) { saveSettings(); }
+  else if (el === $("btnSave")) { saveSettings(); }
+  else if (el === $("btnReset")) { resetSettings(); }
+  else if (el === $("btnClose")) { closeSettings(); }
+}
+
+/* Extrae el ID de playlist de un enlace completo o de un ID suelto.
+   Devuelve {playlistId} o {videoId} o {error}. */
+function parsePlaylistInput(text) {
+  var t = (text || "").replace(/^\s+|\s+$/g, "");
+  if (!t) { return { error: "Pega primero el enlace o el ID de la playlist." }; }
+  var m = t.match(/[?&]list=([A-Za-z0-9_-]+)/);
+  if (m && m[1]) {
+    if (/^(PL|UU|OL|RD|FL)[A-Za-z0-9_-]{8,}$/.test(m[1])) { return { playlistId: m[1] }; }
+    return { error: "Ese enlace trae un list= que no parece un ID de playlist válido." };
+  }
+  if (/^(PL|UU|OL|RD|FL)[A-Za-z0-9_-]{8,}$/.test(t)) { return { playlistId: t }; }
+  var v = t.match(/[?&]v=([A-Za-z0-9_-]{11})/);
+  if (v && v[1]) { return { videoId: v[1] }; }
+  var shortV = t.match(/youtu\.be\/([A-Za-z0-9_-]{11})/);
+  if (shortV && shortV[1]) { return { videoId: shortV[1] }; }
+  return { error: "No encontré ninguna playlist en ese texto. Pega el enlace completo de la playlist (con list=…) o su ID (empieza por PL)." };
+}
+
+function saveSettings() {
+  var input = $("setInput");
+  var res = parsePlaylistInput(input ? input.value : "");
+  if (res.error) { setSettingsMsg(res.error, false); return; }
+  if (res.playlistId) {
+    lsSet("rokolaPlaylistId", res.playlistId);
+    lsRemove("rokolaVideoId");
+    currentPlaylistId = res.playlistId;
+    currentVideoId = "";
+    playlistSource = "override";
+    applyPlaylist();
+    setSettingsMsg("Playlist guardada en esta TV: " + res.playlistId + ". Ya está sonando en aleatorio con OK.", true);
+    refreshSettingsPanel();
+  } else if (res.videoId) {
+    lsSet("rokolaVideoId", res.videoId);
+    lsRemove("rokolaPlaylistId");
+    currentVideoId = res.videoId;
+    currentPlaylistId = "";
+    playlistSource = "video";
+    applyPlaylist();
+    setSettingsMsg("Ojo: eso no era una playlist, era un solo video. Se guardó ese video (" + res.videoId + ") y se reproduce solo. Para una playlist, pega un enlace con list=…", true);
+    refreshSettingsPanel();
+  }
+  sendStatus();
+}
+
+function resetSettings() {
+  lsRemove("rokolaPlaylistId");
+  lsRemove("rokolaVideoId");
+  currentPlaylistId = configPlaylistId;
+  currentVideoId = "";
+  playlistSource = "default";
+  applyPlaylist();
+  setSettingsMsg("Listo: se borró lo guardado y volvió la playlist por defecto (" + configPlaylistId + ").", true);
+  refreshSettingsPanel();
+  sendStatus();
+}
+
+/* ---------- Teclas: una sola función, la usen el padre o el iframe ---------- */
+function handleKey(code) {
+  if (settingsOpen) {
+    if (code === 38) { moveSettingsFocus(-1); return; }
+    if (code === 40) { moveSettingsFocus(1); return; }
+    if (code === 13) { activateSettingsFocused(); return; }
+    if (code === 406) { closeSettings(); return; }
+    if (code === 461 || code === 27) {
+      /* BACK/ESC con ajustes abiertos: se cierran y la app NO sale. */
+      closeSettings();
+      sendBack(true);
+      return;
+    }
+    /* ←/→ dentro de los ajustes: se dejan al navegador (cursor del texto). */
+    return;
+  }
+  if (code === 13) { doToggle(); }
+  else if (code === 39) { doNext(); }
+  else if (code === 37) { doPrev(); }
+  else if (code === 406) { openSettings(); }
+  else if (code === 461 || code === 27) {
+    /* BACK/ESC sin ajustes: la app sí debe salir; se lo confirma al padre. */
+    sendBack(false);
+  }
+  window.setTimeout(sendStatus, 500);
+}
+
+/* Órdenes del padre (la app webOS en file://, origen "null"): se acepta
+   cualquier origen porque el padre no tiene origen web. Los mensajes son
+   solo órdenes de control, no llevan datos sensibles. */
+window.addEventListener("message", function (ev) {
+  var d = ev.data;
+  if (!d || typeof d !== "object" || !d.type) { return; }
+  if (d.type === "key" && typeof d.code === "number") { handleKey(d.code); }
+  else if (d.type === "settings") { toggleSettings(); }
+  else if (d.type === "play") { doPlay(); }
+  else if (d.type === "pause") { doPause(); }
+  else if (d.type === "toggle") { doToggle(); }
+  else if (d.type === "next") { doNext(); }
+  else if (d.type === "prev") { doPrev(); }
+  window.setTimeout(sendStatus, 500);
+}, false);
+
+/* Teclas propias, por si el iframe tiene el foco en la TV o en el navegador.
+   (Las teclas del iframe NO suben al padre: o las recibe el padre, o el
+   iframe, nunca las dos.) */
+document.addEventListener("keydown", function (e) {
+  var code = e.keyCode;
+  var inInput = (document.activeElement === $("setInput"));
+  if (settingsOpen && inInput && (code === 37 || code === 39)) {
+    return; /* ←/→ mueven el cursor dentro del texto, no se tocan */
+  }
+  if (code === 13 || code === 37 || code === 38 || code === 39 || code === 40 ||
+      code === 406 || code === 461 || code === 27) {
+    e.preventDefault();
+    handleKey(code);
+  }
+}, false);
+
+/* Botones (clicables desde PC/móvil para probar el site sin TV). */
+(function bindButtons() {
+  var b = $("btnSettings");
+  if (b) { b.addEventListener("click", toggleSettings, false); }
+  var s = $("btnSave");
+  if (s) { s.addEventListener("click", saveSettings, false); }
+  var r = $("btnReset");
+  if (r) { r.addEventListener("click", resetSettings, false); }
+  var c = $("btnClose");
+  if (c) { c.addEventListener("click", closeSettings, false); }
+})();
+
+(function init() {
+  /* 1) playlist por defecto de playlist.json; 2) override guardado en la TV;
+     3) cargar la API de YouTube. */
+  loadConfig(function () {
+    loadOverride();
+    sendStatus();
+    if (playerReady) { applyPlaylist(); }
+  });
+
+  var tag = document.createElement("script");
+  tag.src = "https://www.youtube.com/iframe_api";
+  tag.onerror = function () {
+    lastError = "El script https://www.youtube.com/iframe_api no cargó (onerror del <script>)";
+    sendStatus();
+  };
+  var firstScript = document.getElementsByTagName("script")[0];
+  firstScript.parentNode.insertBefore(tag, firstScript);
+
+  apiTimer = window.setTimeout(function () {
+    if (!apiLoaded) {
+      lastError = "API no cargó: iframe_api no llamó a onYouTubeIframeAPIReady en 15 s";
+      sendStatus();
+    }
+  }, 15000);
+})();
+</script>
+</body>
+</html>
